@@ -11,6 +11,7 @@ AGENTVM_WORKSPACES="$AGENTVM_HOME/workspaces"
 AGENTVM_STATE="$AGENTVM_HOME/state"
 AGENTVM_ENV_FILE="$AGENTVM_HOME/env"
 AGENTVM_CONFIG_FILE="$AGENTVM_HOME/config"
+AGENTVM_JOURNAL="$AGENTVM_HOME/history.log"
 # Resolve symlinks so profiles/ and sandbox/ are found relative to the real script
 _src="${BASH_SOURCE[0]}"
 while [[ -L "$_src" ]]; do
@@ -275,6 +276,13 @@ save_state() {
   append_state "$name" AGENT_SESSION    "$session"
   append_state "$name" AGENT_PROFILE    "$profile"
   append_state "$name" AGENT_LOG_FILE   "$logfile"
+}
+
+# Append a timestamped event line to the history journal.
+journal() {
+  local event="$1" name="${2:-}" detail="${3:-}"
+  mkdir -p "$AGENTVM_HOME"
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$name" "$detail" >> "$AGENTVM_JOURNAL" 2>/dev/null || true
 }
 
 # Append a KEY=VALUE line to an agent's state file (used to stash optional fields).
@@ -671,6 +679,7 @@ cmd_spawn() {
     "$post_hook" "$name" "$workspace" &>/dev/null || true
   fi
 
+  journal "spawn" "$name" "profile=${_PROFILE_NAME:-} sandbox=${sandbox}"
   info "Agent '${BOLD}${name}${RESET}${GREEN}' spawned."
   printf "  ${CYAN}Session:${RESET}   %s\n" "$session"
   printf "  ${CYAN}Workspace:${RESET} %s\n" "$workspace"
@@ -1276,6 +1285,7 @@ cmd_kill() {
 
   if session_running "$session"; then
     tmux kill-session -t "$session"
+    journal "kill" "$name" ""
     info "Killed agent '${name}' (session '${session}')."
   else
     warn "Agent '${name}' session '${session}' was not running."
@@ -1316,6 +1326,7 @@ cmd_clean() {
       rm -rf "$AGENT_WORKSPACE"
     fi
 
+    journal "clean" "$AGENT_NAME" ""
     printf "${YELLOW}Cleaned${RESET} agent '%s' (workspace: %s)\n" "$AGENT_NAME" "$AGENT_WORKSPACE"
     (( cleaned++ )) || true
   done
@@ -1426,9 +1437,19 @@ cmd_profiles() {
     return 0
   fi
 
+  # Truncate a string to N chars with an ellipsis if longer
+  _trunc() {
+    local s="$1" n="$2"
+    if (( ${#s} > n )); then
+      printf '%s…' "${s:0:n-1}"
+    else
+      printf '%s' "$s"
+    fi
+  }
+
   local found=0
-  printf "${BOLD}%-20s %-25s %-30s %s${RESET}\n" "PROFILE" "LABEL" "COMMAND" "ENV VARS"
-  printf '%s\n' "$(printf '%0.s─' {1..95})"
+  printf "${BOLD}%-16s %-16s %-30s %s${RESET}\n" "PROFILE" "LABEL" "COMMAND" "ENV VARS"
+  printf '%s\n' "$(printf '%0.s─' {1..90})"
 
   local f
   for f in "$PROFILES_DIR"/*.env; do
@@ -1437,17 +1458,31 @@ cmd_profiles() {
     PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_ENV_VARS=""
     # shellcheck source=/dev/null
     source "$f"
-    printf "%-20s %-25s %-30s %s\n" \
+    # Present env vars as comma-separated, first key set highlighted if present
+    local env_display="${PROFILE_ENV_VARS//:/, }"
+    local has_binary=" "
+    local first_word="${PROFILE_CMD%% *}"
+    if [[ -n "$first_word" ]] && command -v "$first_word" &>/dev/null; then
+      has_binary="${GREEN}●${RESET}"
+    else
+      has_binary="${DIM}○${RESET}"
+    fi
+    printf "%s %-14s %-16s %-30s %s\n" \
+      "$has_binary" \
       "$pname" \
-      "${PROFILE_LABEL:-}" \
-      "${PROFILE_CMD:-}" \
-      "${PROFILE_ENV_VARS:-}"
+      "$(_trunc "${PROFILE_LABEL:-}" 16)" \
+      "$(_trunc "${PROFILE_CMD:-}" 30)" \
+      "$(_trunc "${env_display}" 40)"
     (( found++ )) || true
   done
 
   if [[ $found -eq 0 ]]; then
     dim "No profiles found in $PROFILES_DIR"
+  else
+    printf "\n${DIM}● installed    ○ binary not found in PATH${RESET}\n"
   fi
+
+  unset -f _trunc
 }
 
 # ---------------------------------------------------------------------------
@@ -1552,6 +1587,104 @@ Usage: agentvm env <subcommand>
 EOF
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: config — manage $AGENTVM_HOME/config (non-secret defaults)
+# ---------------------------------------------------------------------------
+cmd_config() {
+  init_dirs
+  local sub="${1:-list}"
+  shift || true
+
+  _config_op() {
+    # Shared with cmd_env but targets the config file and accepts any key format.
+    local op="$1" key="${2:-}" val="${3:-}" file="$AGENTVM_CONFIG_FILE"
+    case "$op" in
+      list)
+        [[ -f "$file" ]] || { dim "No config file."; return 0; }
+        local line
+        while IFS= read -r line; do
+          [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+          printf "  %s\n" "$line"
+        done < "$file"
+        ;;
+      get)
+        [[ -n "$key" ]] || die "Usage: agentvm config get KEY"
+        [[ -f "$file" ]] || die "No config file."
+        local line
+        while IFS= read -r line; do
+          [[ "$line" =~ ^[[:space:]]*# ]] && continue
+          if [[ "${line%%=*}" == "$key" ]]; then
+            printf '%s\n' "${line#*=}"
+            return 0
+          fi
+        done < "$file"
+        die "Key '$key' not set"
+        ;;
+      set)
+        [[ -n "$key" ]] || die "Usage: agentvm config set KEY=VALUE"
+        if [[ -z "$val" && "$key" == *"="* ]]; then
+          val="${key#*=}"
+          key="${key%%=*}"
+        fi
+        [[ -n "$val" ]] || die "Usage: agentvm config set KEY VALUE"
+        local tmp
+        tmp="$(mktemp)"
+        local found=false line
+        if [[ -f "$file" ]]; then
+          while IFS= read -r line; do
+            if [[ ! "$line" =~ ^[[:space:]]*# && "${line%%=*}" == "$key" ]]; then
+              printf '%s=%s\n' "$key" "$val" >> "$tmp"
+              found=true
+            else
+              printf '%s\n' "$line" >> "$tmp"
+            fi
+          done < "$file"
+        fi
+        $found || printf '%s=%s\n' "$key" "$val" >> "$tmp"
+        mv "$tmp" "$file"
+        info "Set ${key}"
+        ;;
+      unset)
+        [[ -n "$key" ]] || die "Usage: agentvm config unset KEY"
+        [[ -f "$file" ]] || die "No config file."
+        local tmp line removed=0
+        tmp="$(mktemp)"
+        while IFS= read -r line; do
+          if [[ ! "$line" =~ ^[[:space:]]*# && "${line%%=*}" == "$key" ]]; then
+            removed=1; continue
+          fi
+          printf '%s\n' "$line" >> "$tmp"
+        done < "$file"
+        mv "$tmp" "$file"
+        (( removed )) && info "Unset ${key}" || warn "Key '${key}' was not set"
+        ;;
+      edit)
+        : "${EDITOR:=${VISUAL:-vi}}"
+        "$EDITOR" "$file"
+        ;;
+      path)
+        echo "$file"
+        ;;
+      *)
+        cat <<EOF
+Usage: agentvm config <subcommand>
+  list                   Show all key=value pairs (default)
+  get KEY                Print raw value for KEY
+  set KEY=VALUE          Set KEY in the config file
+  unset KEY              Remove KEY
+  edit                   Open config in \$EDITOR
+  path                   Print the config file path
+
+Common keys:
+  AGENTVM_DEFAULT_PROFILE     Used when spawn is called without --profile
+EOF
+        ;;
+    esac
+  }
+  _config_op "$sub" "$@"
+  unset -f _config_op
 }
 
 # ---------------------------------------------------------------------------
@@ -1884,6 +2017,7 @@ cmd_purge() {
     tmux kill-session -t "${AGENT_SESSION:-}" 2>/dev/null || true
     [[ -n "${AGENT_WORKSPACE:-}" && -d "$AGENT_WORKSPACE" ]] && rm -rf "$AGENT_WORKSPACE"
     rm -f "$f" "$AGENTVM_STATE/${AGENT_NAME}.sb" "$AGENTVM_STATE/${AGENT_NAME}.log"
+    journal "purge" "$AGENT_NAME" ""
     printf "${RED}Purged${RESET} %s\n" "$AGENT_NAME"
   done
 }
@@ -1917,8 +2051,8 @@ _agentvm_complete() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     cword="$COMP_CWORD"
   }
-  local cmds="spawn list ls ps attach exec send broadcast wait logs kill killall clean purge info profiles keys env doctor run watch swarm restart rename clone root upgrade completion help version"
-  local agent_cmds="attach exec send logs kill info restart rename clone wait"
+  local cmds="spawn list ls ps attach exec send broadcast wait logs kill killall clean purge info profiles keys env doctor run watch swarm restart rename clone diff grid open history stats root upgrade completion help version"
+  local agent_cmds="attach exec send logs kill info restart rename clone wait diff open"
   if [[ $cword -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
     return
@@ -1940,7 +2074,7 @@ _agentvm_complete() {
     COMPREPLY=( $(compgen -W "$agents" -- "$cur") )
     return
   fi
-  if [[ "$sub" == "env" && $cword -eq 2 ]]; then
+  if [[ ( "$sub" == "env" || "$sub" == "config" ) && $cword -eq 2 ]]; then
     COMPREPLY=( $(compgen -W "list get set unset edit path" -- "$cur") )
     return
   fi
@@ -1990,7 +2124,7 @@ _agentvm() {
     return
   fi
   case "$words[2]" in
-    attach|exec|send|logs|kill|info|restart|rename|clone|wait)
+    attach|exec|send|logs|kill|info|restart|rename|clone|wait|diff|open)
       agents=("${(@f)$(agentvm list -q 2>/dev/null)}")
       _values 'agent' $agents ;;
     spawn|run|swarm)
@@ -2005,7 +2139,7 @@ _agentvm() {
           _values 'profile' $profiles ;;
       esac
       ;;
-    env)
+    env|config)
       _values 'subcommand' list get set unset edit path ;;
   esac
 }
@@ -2027,6 +2161,183 @@ EOF
       die "Unsupported shell: $shell (supported: bash, zsh)"
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: history — show the lifecycle journal
+# ---------------------------------------------------------------------------
+cmd_history() {
+  local n=50 event=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n) n="$2"; shift 2 ;;
+      -e|--event) event="$2"; shift 2 ;;
+      *) die "Unknown flag '$1' for history" ;;
+    esac
+  done
+  [[ -f "$AGENTVM_JOURNAL" ]] || { dim "No history yet."; return 0; }
+  printf "${BOLD}%-20s %-8s %-20s %s${RESET}\n" "WHEN (UTC)" "EVENT" "AGENT" "DETAIL"
+  printf '%s\n' "$(printf '%0.s─' {1..90})"
+  local tailed
+  tailed="$(tail -n "$n" "$AGENTVM_JOURNAL")"
+  if [[ -n "$event" ]]; then
+    tailed="$(printf '%s\n' "$tailed" | awk -F'\t' -v e="$event" '$2==e')"
+  fi
+  printf '%s\n' "$tailed" | awk -F'\t' '{printf "%-20s %-8s %-20s %s\n", $1, $2, $3, $4}'
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: stats — aggregate counts across all agents (alive + history)
+# ---------------------------------------------------------------------------
+cmd_stats() {
+  init_dirs
+
+  local env_files=() f
+  while IFS= read -r -d '' f; do env_files+=("$f"); done \
+    < <(find "$AGENTVM_STATE" -maxdepth 1 -name '*.env' -print0 2>/dev/null | sort -z)
+
+  local total="${#env_files[@]}" running=0 dead=0
+  for f in "${env_files[@]+"${env_files[@]}"}"; do
+    AGENT_SESSION=""
+    # shellcheck source=/dev/null
+    source "$f"
+    if session_running "$AGENT_SESSION"; then running=$((running+1)); else dead=$((dead+1)); fi
+  done
+
+  # Aggregate workspace and log sizes
+  local total_ws_bytes=0 total_log_bytes=0
+  if [[ -d "$AGENTVM_WORKSPACES" ]]; then
+    total_ws_bytes=$(du -sk "$AGENTVM_WORKSPACES" 2>/dev/null | awk '{print $1 * 1024}')
+  fi
+  local log_file
+  for log_file in "$AGENTVM_STATE"/*.log; do
+    [[ -f "$log_file" ]] || continue
+    local s
+    if stat -f '%z' "$log_file" &>/dev/null; then
+      s=$(stat -f '%z' "$log_file")
+    else
+      s=$(stat -c '%s' "$log_file" 2>/dev/null || echo 0)
+    fi
+    total_log_bytes=$((total_log_bytes + s))
+  done
+
+  # History counts
+  local hist_spawns=0 hist_kills=0 hist_cleans=0 hist_purges=0
+  if [[ -f "$AGENTVM_JOURNAL" ]]; then
+    hist_spawns=$(awk -F'\t' '$2=="spawn"' "$AGENTVM_JOURNAL" | wc -l | tr -d ' ')
+    hist_kills=$(awk -F'\t' '$2=="kill"' "$AGENTVM_JOURNAL" | wc -l | tr -d ' ')
+    hist_cleans=$(awk -F'\t' '$2=="clean"' "$AGENTVM_JOURNAL" | wc -l | tr -d ' ')
+    hist_purges=$(awk -F'\t' '$2=="purge"' "$AGENTVM_JOURNAL" | wc -l | tr -d ' ')
+  fi
+
+  printf "${BOLD}agentvm stats${RESET}\n\n"
+  printf "  ${CYAN}Current${RESET}\n"
+  printf "    agents:      %d  (${GREEN}%d running${RESET}, ${RED}%d dead${RESET})\n" "$total" "$running" "$dead"
+  printf "    workspaces:  %s\n" "$(awk -v b="$total_ws_bytes" 'BEGIN{
+    if (b<1024) printf "%dB", b;
+    else if (b<1024*1024) printf "%.1fK", b/1024;
+    else if (b<1024*1024*1024) printf "%.1fM", b/1024/1024;
+    else printf "%.2fG", b/1024/1024/1024;
+  }')"
+  printf "    logs:        %s\n" "$(awk -v b="$total_log_bytes" 'BEGIN{
+    if (b<1024) printf "%dB", b;
+    else if (b<1024*1024) printf "%.1fK", b/1024;
+    else if (b<1024*1024*1024) printf "%.1fM", b/1024/1024;
+    else printf "%.2fG", b/1024/1024/1024;
+  }')"
+  printf "\n  ${CYAN}Lifetime (journal)${RESET}\n"
+  printf "    spawns:      %d\n" "$hist_spawns"
+  printf "    kills:       %d\n" "$hist_kills"
+  printf "    cleans:      %d\n" "$hist_cleans"
+  printf "    purges:      %d\n" "$hist_purges"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: diff — show workspace changes since spawn
+# ---------------------------------------------------------------------------
+cmd_diff() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: agentvm diff <name>"
+  validate_name "$name"
+  load_state "$name"
+
+  [[ -d "$AGENT_WORKSPACE" ]] || die "Workspace missing: $AGENT_WORKSPACE"
+
+  # If workspace is a git repo, prefer git diff (shows staged + unstaged + untracked)
+  if [[ -d "$AGENT_WORKSPACE/.git" ]]; then
+    info "git status + diff in workspace:"
+    ( cd "$AGENT_WORKSPACE" && git -c color.ui=always status --short && echo && git -c color.ui=always diff HEAD ) || true
+    return 0
+  fi
+
+  # Otherwise enumerate files and mtimes newer than the state file's ctime
+  local state_file
+  state_file="$(state_file "$name")"
+  info "Files changed since spawn (workspace is not a git repo):"
+  find "$AGENT_WORKSPACE" -type f -newer "$state_file" 2>/dev/null | head -200 | \
+    sed "s|^$AGENT_WORKSPACE/||"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: grid — open a single tmux session with a window per running agent
+# ---------------------------------------------------------------------------
+cmd_grid() {
+  require_tmux
+  init_dirs
+
+  local env_files=() f
+  while IFS= read -r -d '' f; do env_files+=("$f"); done \
+    < <(find "$AGENTVM_STATE" -maxdepth 1 -name '*.env' -print0 2>/dev/null | sort -z)
+
+  local -a agents=()
+  for f in "${env_files[@]+"${env_files[@]}"}"; do
+    AGENT_NAME="" AGENT_SESSION=""
+    # shellcheck source=/dev/null
+    source "$f"
+    session_running "$AGENT_SESSION" || continue
+    agents+=("$AGENT_NAME")
+  done
+
+  [[ ${#agents[@]} -gt 0 ]] || die "No running agents to grid. Spawn something first."
+
+  local grid_session="agentvm-grid"
+  tmux kill-session -t "$grid_session" 2>/dev/null || true
+  # Window 0: attach-session to first agent
+  tmux new-session -d -s "$grid_session" -n "${agents[0]}" \
+    "tmux attach -t $(tmux_session "${agents[0]}")"
+
+  # One window per remaining agent
+  local i
+  for (( i=1; i<${#agents[@]}; i++ )); do
+    tmux new-window -t "$grid_session" -n "${agents[i]}" \
+      "tmux attach -t $(tmux_session "${agents[i]}")"
+  done
+
+  info "Grid session '${grid_session}' has ${#agents[@]} window(s). Switch windows with Ctrl-b n/p."
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$grid_session"
+  else
+    tmux attach-session -t "$grid_session"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: open — open agent's workspace in the OS file manager
+# ---------------------------------------------------------------------------
+cmd_open() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: agentvm open <name>"
+  validate_name "$name"
+  load_state "$name"
+  [[ -d "$AGENT_WORKSPACE" ]] || die "Workspace missing: $AGENT_WORKSPACE"
+
+  if command -v open &>/dev/null; then
+    open "$AGENT_WORKSPACE"
+  elif command -v xdg-open &>/dev/null; then
+    xdg-open "$AGENT_WORKSPACE"
+  else
+    echo "$AGENT_WORKSPACE"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2096,7 +2407,8 @@ ${BOLD}USAGE${RESET}
   agentvm <command> [arguments]
 
 ${BOLD}LIFECYCLE${RESET}
-  ${CYAN}spawn${RESET} <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t K=V]... [-- cmd...]
+  ${CYAN}spawn${RESET} <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t K=V]...
+        [--from-dir <path>|--from-git <url> [--ref <ref>]] [-- cmd...]
                                               Create workspace and start sandboxed tmux session
   ${CYAN}run${RESET}   [-p <profile>] [--prompt <file>] [--timeout <s>] [--keep] [-- cmd...]
                                               Spawn → wait → print output → cleanup (ephemeral)
@@ -2105,6 +2417,11 @@ ${BOLD}LIFECYCLE${RESET}
   ${CYAN}restart${RESET} <name>                       Restart an agent reusing its stored config
   ${CYAN}clone${RESET} <src> <dst>                    Clone a workspace to a new agent (dead)
   ${CYAN}rename${RESET} <old> <new>                   Rename agent (workspace, session, logs)
+  ${CYAN}diff${RESET}   <name>                        Show workspace changes since spawn
+  ${CYAN}open${RESET}   <name>                        Open workspace in OS file manager
+  ${CYAN}grid${RESET}                                 Open tmux session with a window per running agent
+  ${CYAN}history${RESET} [-n <lines>] [-e <event>]    Show the lifecycle journal
+  ${CYAN}stats${RESET}                                Aggregate counts and storage sizes
 
 ${BOLD}OBSERVE${RESET}
   ${CYAN}list${RESET} [--tag K=V] [--status s] [-q|--json]    List agents; -q prints names only
@@ -2127,7 +2444,8 @@ ${BOLD}MANAGE${RESET}
 ${BOLD}CONFIGURE${RESET}
   ${CYAN}profiles${RESET}                              List available profiles
   ${CYAN}keys${RESET}                                  Show API key status
-  ${CYAN}env${RESET} {list|get|set|unset|edit|path}    Manage the env file
+  ${CYAN}env${RESET} {list|get|set|unset|edit|path}    Manage the env file (secret keys)
+  ${CYAN}config${RESET} {list|get|set|unset|edit|path} Manage the config file (defaults)
   ${CYAN}doctor${RESET}                                Diagnose installation and environment
   ${CYAN}completion${RESET} <bash|zsh>                 Emit shell-completion script
   ${CYAN}upgrade${RESET}                               git pull the install directory
@@ -2249,6 +2567,7 @@ main() {
     profiles)   cmd_profiles "$@" ;;
     keys)       cmd_keys "$@" ;;
     env)        cmd_env "$@" ;;
+    config)     cmd_config "$@" ;;
     doctor)     cmd_doctor "$@" ;;
     run)        cmd_run "$@" ;;
     watch)      cmd_watch "$@" ;;
@@ -2256,6 +2575,11 @@ main() {
     restart)    cmd_restart "$@" ;;
     rename|mv)  cmd_rename "$@" ;;
     clone|cp)   cmd_clone "$@" ;;
+    diff)       cmd_diff "$@" ;;
+    grid)       cmd_grid "$@" ;;
+    open)       cmd_open "$@" ;;
+    history)    cmd_history "$@" ;;
+    stats)      cmd_stats "$@" ;;
     root)       cmd_root "$@" ;;
     upgrade)    cmd_upgrade "$@" ;;
     completion) cmd_completion "$@" ;;

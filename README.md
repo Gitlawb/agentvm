@@ -66,7 +66,7 @@ agentvm attach c1           # hop into its pane
 
 | Command | Description |
 |---|---|
-| `agentvm spawn <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t K=V]... [-- cmd...]` | Create workspace and start a sandboxed tmux session |
+| `agentvm spawn <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t K=V]... [--from-dir <path>\|--from-git <url> [--ref <ref>]] [-- cmd...]` | Create workspace and start a sandboxed tmux session |
 | `agentvm run [-p <profile>] [--prompt <file>] [--timeout <s>] [--keep] [-- cmd...]` | Ephemeral one-shot: spawn → wait → print logs → cleanup |
 | `agentvm swarm <base> <n> [-p <profile>] [--prompt <file>] [-t K=V]...` | Spawn N agents named `<base>-1 .. <base>-N` |
 | `agentvm restart <name>` | Restart an agent reusing its stored profile/prompt/tags/command |
@@ -80,6 +80,11 @@ agentvm attach c1           # hop into its pane
 | `agentvm list [--tag K=V] [--status running\|dead] [-q\|--json]` | List agents with status, PID, profile, tags |
 | `agentvm ps [--all] [--json]` | Resource usage (CPU%, MEM%, RSS, uptime) |
 | `agentvm info <name> [--json]` | Detailed info including DID, prompt file, log size |
+| `agentvm stats` | Aggregate counts + workspace/log byte sizes |
+| `agentvm history [-n <lines>] [-e <event>]` | Lifecycle journal (spawn/kill/clean/purge) |
+| `agentvm diff <name>` | Files changed in workspace since spawn (git-aware) |
+| `agentvm grid` | Open a single tmux session with one window per running agent |
+| `agentvm open <name>` | Open workspace in OS file manager |
 | `agentvm logs <name> [-n <lines>] [-f] [--raw]` | Tail the persistent log file (ANSI stripped by default) |
 | `agentvm watch [-n <seconds>]` | Live dashboard: ps + last-3-lines tail of every running agent |
 | `agentvm attach <name>` | Attach to agent's tmux session |
@@ -189,6 +194,23 @@ agentvm clone reviewer reviewer-experiment
 agentvm restart reviewer-experiment
 ```
 
+### Run an agent against an existing project
+
+```sh
+# copy a local dir into the workspace
+agentvm spawn refactor -p claude-code --from-dir ~/Projects/my-app --prompt /tmp/task.md
+
+# or clone a git repo at a specific ref
+agentvm spawn trial -p claude-code --from-git https://github.com/foo/bar --ref main
+```
+
+### Inspect what an agent changed
+
+```sh
+agentvm diff refactor     # shows `git status -s` + `git diff HEAD` if workspace is a git repo
+                          # falls back to find-newer-than-spawn-time for non-git workspaces
+```
+
 ### Identity-per-agent (decentralized)
 
 ```sh
@@ -206,6 +228,10 @@ agentvm spawn claude-1 -p claude-code --gitlawb
 $AGENTVM_HOME/               # default: ~/.agentvm
 ├── env                      # API keys (chmod 600, sourced automatically)
 ├── config                   # shell-level defaults (AGENTVM_DEFAULT_PROFILE, etc.)
+├── history.log              # lifecycle journal (tab-separated)
+├── hooks/                   # optional user scripts:
+│   ├── pre-spawn            #   runs before session starts:  $1=name $2=workspace
+│   └── post-spawn           #   runs after session starts
 ├── workspaces/
 │   └── <name>/              # agent's private read-write workspace
 └── state/

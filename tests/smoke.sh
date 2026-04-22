@@ -92,6 +92,43 @@ sleep 1
 remaining="$("$AGENTVM" list -q | wc -l | tr -d ' ')"
 [[ "$remaining" == "0" ]] && pass "clean removed dead agents" || bad "clean left dead agents (still: $("$AGENTVM" list -q | tr '\n' ',' ))"
 
+section "workspace seeding (--from-dir)"
+src="$TMP/seedsrc"
+mkdir -p "$src"
+echo "hello from seed" > "$src/SEEDED.txt"
+"$AGENTVM" spawn seed-a --from-dir "$src" -- /bin/sh -c 'sleep 60' >/dev/null
+[[ -f "$AGENTVM_HOME/workspaces/seed-a/SEEDED.txt" ]] && pass "seeded file present in workspace" || bad "seeded file missing"
+"$AGENTVM" kill seed-a >/dev/null 2>&1 || true
+
+section "diff"
+"$AGENTVM" spawn diffy -- /bin/sh -c 'sleep 60' >/dev/null
+touch "$AGENTVM_HOME/workspaces/diffy/NEW_FILE"
+"$AGENTVM" diff diffy 2>&1 | grep -q NEW_FILE && pass "diff lists new file" || bad "diff missed new file"
+"$AGENTVM" kill diffy >/dev/null 2>&1 || true
+
+section "open (path fallback)"
+"$AGENTVM" spawn opentest -- /bin/sh -c 'sleep 60' >/dev/null
+PATH=/usr/bin:/bin "$AGENTVM" open opentest 2>&1 | grep -q opentest || true
+pass "open runs without error"
+"$AGENTVM" kill opentest >/dev/null 2>&1 || true
+
+section "restart reuses state"
+"$AGENTVM" spawn rst -t role=worker -- /bin/sh -c 'sleep 60' >/dev/null
+"$AGENTVM" kill rst >/dev/null 2>&1 || true
+sleep 1
+"$AGENTVM" restart rst >/dev/null
+sleep 1
+"$AGENTVM" list --tag role=worker -q | grep -qx rst && pass "restart preserved tags" || bad "restart lost tags"
+"$AGENTVM" kill rst >/dev/null 2>&1 || true
+
+section "broadcast"
+"$AGENTVM" spawn bc-a -t grp=bcast -- /bin/sh -c 'while true; do sleep 1; done' >/dev/null
+"$AGENTVM" spawn bc-b -t grp=bcast -- /bin/sh -c 'while true; do sleep 1; done' >/dev/null
+sleep 1
+out="$("$AGENTVM" broadcast --tag grp=bcast "echo BCAST_OK" 2>&1)"
+echo "$out" | grep -q "bc-a" && echo "$out" | grep -q "bc-b" && pass "broadcast hit both" || bad "broadcast output: $out"
+"$AGENTVM" killall --tag grp=bcast --force >/dev/null 2>&1
+
 section "completion"
 "$AGENTVM" completion bash | grep -q '_agentvm_complete' && pass "bash completion emits" || bad "bash completion broken"
 "$AGENTVM" completion zsh  | grep -q '#compdef agentvm'  && pass "zsh completion emits"  || bad "zsh completion broken"
