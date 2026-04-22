@@ -1,0 +1,57 @@
+; macOS Seatbelt (sandbox-exec) profile for agentvm
+; __WORKSPACE__ and __AGENTVM_HOME__ are replaced with actual paths at spawn time.
+;
+; Policy: write-isolated — agents can READ everything (needed for complex binaries
+; like Claude Code / Codex that access many system paths), but can only WRITE to
+; their own workspace and standard temp directories. This is the meaningful security
+; boundary: an agent cannot modify the host filesystem outside its workspace.
+
+(version 1)
+
+; --- Default deny ---
+(deny default)
+
+; --- Process operations ---
+(allow process-exec)
+(allow process-fork)
+(allow signal)
+(allow process-info-pidinfo)
+(allow process-info-setcontrol)
+
+; --- System/IPC ---
+(allow sysctl-read)
+(allow mach-lookup)
+(allow ipc-posix-shm)
+(allow ipc-posix-shm-read-data)
+(allow ipc-posix-shm-write-create)
+(allow ipc-posix-shm-write-data)
+
+; --- Network (unrestricted by default; comment out to isolate) ---
+(allow network*)
+(allow system-socket)
+
+; --- Read: allow everything ---
+; Complex agent binaries (Bun-based Claude Code, Node-based Codex, etc.) access
+; a wide variety of system paths at startup. Restricting reads is fragile and
+; causes crashes. The meaningful isolation is on WRITES.
+(allow file-read*)
+
+; --- /dev: ioctl + read/write pseudo-files (e.g. /dev/null, /dev/stdout, /dev/stderr) ---
+; Shells and tools routinely write to /dev/null; restricting writes here breaks them.
+(allow file-ioctl (subpath "/dev"))
+(allow file-write* (subpath "/dev"))
+
+; --- Write: temp/cache dirs ---
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/var/folders"))
+(allow file-write* (subpath "/private/var/folders"))
+
+; --- Write: agent workspace (the only place the agent should persist work) ---
+(allow file-write* (subpath "__WORKSPACE__"))
+
+; --- Write: agentvm home (allows nested agentvm spawn — meta-agent pattern) ---
+; An agent running agentvm spawn needs to create workspaces and state files under
+; AGENTVM_HOME. Without this, mkdir/state writes fail with EPERM when agentvm is
+; invoked from inside a sandboxed session.
+(allow file-write* (subpath "__AGENTVM_HOME__"))
