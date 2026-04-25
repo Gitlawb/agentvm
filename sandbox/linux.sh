@@ -6,7 +6,9 @@
 # Environment variables (set by agentvm):
 #   AGENTVM_EXTRA_RO_PATHS  Colon-separated extra read-only bind mounts
 #   AGENTVM_EXTRA_RW_PATHS  Colon-separated extra read-write bind mounts
-#   AGENTVM_FORWARD_VARS    Colon-separated env var names to forward into sandbox
+#
+# Provider env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, …)
+# are inherited from the parent process — bwrap does not --clearenv.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -25,6 +27,9 @@ if [[ ! -d "$WORKSPACE" ]]; then
   echo "error: workspace directory does not exist: $WORKSPACE" >&2
   exit 1
 fi
+
+AGENT_HOME="$WORKSPACE/.home"
+mkdir -p "$AGENT_HOME"
 
 # ---------------------------------------------------------------------------
 # Build bwrap arguments
@@ -82,8 +87,9 @@ if [[ -n "${AGENTVM_EXTRA_RW_PATHS:-}" ]]; then
   done
 fi
 
-# --- Writable agent workspace ---
-BWRAP_ARGS+=(--bind "$WORKSPACE" /workspace)
+# --- Writable agent workspace (bound at its real host path so HOME paths
+#     match inside and outside the sandbox — important for per-agent HOME). ---
+BWRAP_ARGS+=(--bind "$WORKSPACE" "$WORKSPACE")
 
 # --- Ephemeral filesystems ---
 BWRAP_ARGS+=(
@@ -96,7 +102,7 @@ BWRAP_ARGS+=(
 BWRAP_ARGS+=(--hostname agentvm)
 
 # --- Working directory ---
-BWRAP_ARGS+=(--chdir /workspace)
+BWRAP_ARGS+=(--chdir "$WORKSPACE")
 
 # --- New session ---
 BWRAP_ARGS+=(--new-session)
@@ -104,20 +110,10 @@ BWRAP_ARGS+=(--new-session)
 # --- Base environment ---
 BWRAP_ARGS+=(
   --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-  --setenv HOME /workspace
+  --setenv HOME "$AGENT_HOME"
   --setenv TERM "${TERM:-xterm-256color}"
   --setenv LANG "${LANG:-C.UTF-8}"
 )
-
-# --- Forward profile env vars ---
-if [[ -n "${AGENTVM_FORWARD_VARS:-}" ]]; then
-  IFS=':' read -ra _fwd_vars <<< "$AGENTVM_FORWARD_VARS"
-  for _var in "${_fwd_vars[@]}"; do
-    if [[ -n "$_var" && -n "${!_var:-}" ]]; then
-      BWRAP_ARGS+=(--setenv "$_var" "${!_var}")
-    fi
-  done
-fi
 
 # ---------------------------------------------------------------------------
 # Execute

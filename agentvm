@@ -96,8 +96,8 @@ _PROFILE_NAME=""
 _PROFILE_LABEL=""
 _PROFILE_CMD=""
 _PROFILE_RO_PATHS=""              # colon-separated extra read-only paths
-_PROFILE_RW_PATHS=""              # colon-separated extra read-write paths
-_PROFILE_ENV_VARS=""              # colon-separated env var names to forward into the sandbox
+_PROFILE_RW_PATHS=""              # colon-separated extra read-write paths (rare; most state belongs in PROFILE_STATE_DIRS)
+_PROFILE_STATE_DIRS=""            # colon-separated paths (relative to $HOME) seeded into per-agent HOME
 _PROFILE_STARTUP_KEYS=""          # keys to send to the tmux session shortly after startup
 _PROFILE_POST_CREATE_SCRIPT=""    # script run in the workspace after creation (before spawn)
 
@@ -107,7 +107,7 @@ load_profile() {
   [[ -f "$pfile" ]] || die "Profile '${name}' not found. Run 'agentvm profiles' to list available profiles."
 
   # Reset before sourcing
-  PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_ENV_VARS="" PROFILE_STARTUP_KEYS="" PROFILE_POST_CREATE_SCRIPT=""
+  PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_STATE_DIRS="" PROFILE_STARTUP_KEYS="" PROFILE_POST_CREATE_SCRIPT=""
   # shellcheck source=/dev/null
   source "$pfile"
 
@@ -116,14 +116,62 @@ load_profile() {
   _PROFILE_CMD="${PROFILE_CMD:-}"
   _PROFILE_RO_PATHS="${PROFILE_RO_PATHS:-}"
   _PROFILE_RW_PATHS="${PROFILE_RW_PATHS:-}"
-  _PROFILE_ENV_VARS="${PROFILE_ENV_VARS:-}"
+  _PROFILE_STATE_DIRS="${PROFILE_STATE_DIRS:-}"
   _PROFILE_STARTUP_KEYS="${PROFILE_STARTUP_KEYS:-}"
   _PROFILE_POST_CREATE_SCRIPT="${PROFILE_POST_CREATE_SCRIPT:-}"
 }
 
 reset_profile() {
   _PROFILE_NAME="" _PROFILE_LABEL="" _PROFILE_CMD=""
-  _PROFILE_RO_PATHS="" _PROFILE_RW_PATHS="" _PROFILE_ENV_VARS="" _PROFILE_STARTUP_KEYS="" _PROFILE_POST_CREATE_SCRIPT=""
+  _PROFILE_RO_PATHS="" _PROFILE_RW_PATHS="" _PROFILE_STATE_DIRS="" _PROFILE_STARTUP_KEYS="" _PROFILE_POST_CREATE_SCRIPT=""
+}
+
+# Per-agent HOME: each spawned agent gets <workspace>/.home/ as $HOME inside the
+# sandbox. State dirs declared by the profile (e.g. .claude, .codex) are seeded
+# from the host's $HOME so the agent inherits login/settings, then diverges.
+agent_home_dir() { echo "$1/.home"; }
+
+seed_agent_home() {
+  local workspace="$1" name="${2:-agent}"
+  local home_dir
+  home_dir="$(agent_home_dir "$workspace")"
+  mkdir -p "$home_dir"
+
+  # Write a minimal .zshrc / .zshenv. We deliberately do NOT copy the host's
+  # dotfiles — they typically reference oh-my-zsh, ~/.cargo/env, and other
+  # paths that don't exist inside the sandbox HOME, producing noisy startup
+  # errors. PATH and provider env vars are inherited from tmux's parent env.
+  if [[ ! -e "$home_dir/.zshenv" ]]; then
+    cat > "$home_dir/.zshenv" <<'ZSHENV'
+# agentvm minimal .zshenv — overrides nothing, inherits PATH from parent env.
+ZSHENV
+  fi
+  if [[ ! -e "$home_dir/.zshrc" ]]; then
+    cat > "$home_dir/.zshrc" <<ZSHRC
+# agentvm minimal .zshrc
+export PS1='%F{cyan}agent:${name}%f %~ %# '
+alias ll='ls -la'
+ZSHRC
+  fi
+  if [[ ! -e "$home_dir/.bashrc" ]]; then
+    cat > "$home_dir/.bashrc" <<BASHRC
+# agentvm minimal .bashrc
+export PS1='\[\e[36m\]agent:${name}\[\e[0m\] \w \\$ '
+alias ll='ls -la'
+BASHRC
+  fi
+
+  [[ -z "$_PROFILE_STATE_DIRS" ]] && return 0
+  local IFS=':'
+  local p src dst
+  for p in $_PROFILE_STATE_DIRS; do
+    [[ -z "$p" ]] && continue
+    src="$HOME/$p"
+    dst="$home_dir/$p"
+    [[ -e "$src" ]] || continue
+    [[ -e "$dst" ]] && continue   # don't clobber on re-spawn
+    cp -R "$src" "$dst" 2>/dev/null || warn "Failed to seed $p into agent HOME"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -150,33 +198,66 @@ find_gl_binary() {
 }
 
 # Generate a fresh DID in the agent's workspace and register it.
+# Identity lives in <workspace>/.home/.gitlawb/ so it travels with the agent
+# and doesn't collide with the host's gl identity.
 # All progress messages go to stderr; only the DID goes to stdout.
+#
+# mode: "force" (die if gl missing) or "auto" (silent skip — return empty).
 provision_gitlawb_id() {
   local workspace="$1"
-  find_gl_binary || die "gl binary not found. Install it from gitlawb.com"
+  local mode="${2:-force}"
+
+  if ! find_gl_binary; then
+    if [[ "$mode" == "force" ]]; then
+      die "gl binary not found. Install it from gitlawb.com (or pass --no-gitlawb)."
+    fi
+    return 0
+  fi
+
+  local home_dir
+  home_dir="$(agent_home_dir "$workspace")"
+  mkdir -p "$home_dir"
 
   info "Generating gitlawb identity for agent..." >&2
-  if ! HOME="$workspace" "$GL_BIN" identity new >&2 2>&1; then
-    die "Failed to generate gitlawb identity."
+  if ! HOME="$home_dir" "$GL_BIN" identity new >&2 2>&1; then
+    [[ "$mode" == "force" ]] && die "Failed to generate gitlawb identity."
+    warn "gitlawb identity generation failed (continuing without DID)." >&2
+    return 0
   fi
 
   info "Registering identity with gitlawb node..." >&2
-  if ! HOME="$workspace" "$GL_BIN" register >&2 2>&1; then
+  if ! HOME="$home_dir" "$GL_BIN" register >&2 2>&1; then
     warn "Registration failed (network issue?). Agent has a DID but is not yet registered." >&2
   fi
 
-  HOME="$workspace" "$GL_BIN" identity show 2>/dev/null || true
+  HOME="$home_dir" "$GL_BIN" identity show 2>/dev/null || true
 }
 
-# Build a space-separated list of "KEY=VALUE" pairs for env vars in _PROFILE_ENV_VARS
-# Only includes vars that are actually set in the current environment
-profile_env_pairs() {
-  [[ -z "$_PROFILE_ENV_VARS" ]] && return 0
-  local IFS=':'
-  local var
-  for var in $_PROFILE_ENV_VARS; do
-    [[ -n "$var" && -n "${!var:-}" ]] && printf '%s=%s ' "$var" "${!var}"
-  done
+# Write <workspace>/.home/.gitconfig so any git op the agent performs inside
+# the sandbox attributes commits to the agent (not the host user). When a DID
+# is available, use it as the email; otherwise fall back to <name>@agentvm.local.
+setup_agent_git_config() {
+  local name="$1" workspace="$2" agent_did="${3:-}"
+  local home_dir
+  home_dir="$(agent_home_dir "$workspace")"
+  mkdir -p "$home_dir"
+
+  local email
+  if [[ -n "$agent_did" ]]; then
+    email="${agent_did}@gitlawb"
+  else
+    email="${name}@agentvm.local"
+  fi
+
+  cat > "$home_dir/.gitconfig" <<GITCFG
+[user]
+	name = ${name}
+	email = ${email}
+[init]
+	defaultBranch = main
+[safe]
+	directory = *
+GITCFG
 }
 
 # ---------------------------------------------------------------------------
@@ -184,11 +265,14 @@ profile_env_pairs() {
 # ---------------------------------------------------------------------------
 
 # Source the env file if it exists. Called early in main() so API keys are
-# in the environment before profile env-var forwarding is evaluated.
+# inherited by spawned agents. `set -a` auto-exports every assignment so users
+# can write either `KEY=val` or `export KEY=val` in ~/.agentvm/env.
 load_env_file() {
   [[ -f "$AGENTVM_ENV_FILE" ]] || return 0
+  set -a
   # shellcheck source=/dev/null
   source "$AGENTVM_ENV_FILE"
+  set +a
 }
 
 # Source the config file if it exists. Config provides shell-level defaults
@@ -206,6 +290,8 @@ init_config_file() {
 # Lines here override shell defaults. Supported keys:
 #
 # AGENTVM_DEFAULT_PROFILE=claude-code   # used when spawn is called without --profile
+# AGENTVM_GITLAWB_DEFAULT=true          # auto-provision a DID per spawn (default true);
+#                                       # set to false to require explicit --gitlawb
 CFGEOF
 }
 
@@ -214,17 +300,20 @@ init_env_file() {
   [[ -f "$AGENTVM_ENV_FILE" ]] && return 0
   cat > "$AGENTVM_ENV_FILE" <<'ENVEOF'
 # agentvm API keys — sourced automatically before every agentvm command.
-# Keys set here are forwarded into agent sandboxes by the profile system.
+# Anything exported here (or in your shell) is inherited by the agent sandbox.
 # Keep this file private — never commit it to version control.
 #
-# Claude Code (Anthropic)
-# ANTHROPIC_API_KEY=sk-ant-...
-# ANTHROPIC_BASE_URL=          # optional: custom endpoint
+# Claude Code / OpenClaude (Anthropic-compatible)
+# export ANTHROPIC_API_KEY=sk-ant-...
+# export ANTHROPIC_BASE_URL=
 #
-# OpenAI Codex
-# OPENAI_API_KEY=sk-proj-...
-# OPENAI_ORG_ID=               # optional
-# OPENAI_BASE_URL=             # optional: custom endpoint
+# OpenAI Codex / OpenClaude (OpenAI-compatible)
+# export OPENAI_API_KEY=sk-proj-...
+# export OPENAI_BASE_URL=
+# export OPENAI_ORG_ID=
+#
+# Gemini
+# export GEMINI_API_KEY=
 ENVEOF
   chmod 600 "$AGENTVM_ENV_FILE"
 }
@@ -388,12 +477,12 @@ build_sandbox_cmd_bwrap() {
     cmd=(/bin/bash)
   fi
 
-  # Pass extra paths and env vars to linux.sh via environment
-  # (linux.sh reads AGENTVM_EXTRA_RO_PATHS, AGENTVM_EXTRA_RW_PATHS, AGENTVM_FORWARD_VARS)
+  # Pass extra paths to linux.sh via environment.
+  # Provider env vars (ANTHROPIC_API_KEY etc.) inherit naturally — bwrap doesn't
+  # clearenv, so anything in the parent process passes through.
   local env_prefix=""
   [[ -n "${_PROFILE_RO_PATHS:-}" ]] && env_prefix+="AGENTVM_EXTRA_RO_PATHS=${_PROFILE_RO_PATHS} "
   [[ -n "${_PROFILE_RW_PATHS:-}" ]] && env_prefix+="AGENTVM_EXTRA_RW_PATHS=${_PROFILE_RW_PATHS} "
-  [[ -n "${_PROFILE_ENV_VARS:-}" ]] && env_prefix+="AGENTVM_FORWARD_VARS=${_PROFILE_ENV_VARS} "
 
   echo "${env_prefix}bash ${linux_sh} ${workspace} ${cmd[*]}"
 }
@@ -425,7 +514,10 @@ cmd_spawn() {
 
   local name=""
   local profile_name=""
-  local do_gitlawb=false
+  # Tri-state: "auto" (provision DID if gl is installed, silent skip otherwise),
+  # "force" (--gitlawb: provision or die), "off" (--no-gitlawb).
+  local gitlawb_mode="auto"
+  [[ "${AGENTVM_GITLAWB_DEFAULT:-true}" == "false" ]] && gitlawb_mode="off"
   local prompt_file=""
   local tags=""
   local from_dir=""
@@ -446,7 +538,12 @@ cmd_spawn() {
         continue
         ;;
       --gitlawb|--id)
-        do_gitlawb=true
+        gitlawb_mode="force"
+        shift
+        continue
+        ;;
+      --no-gitlawb|--no-id)
+        gitlawb_mode="off"
         shift
         continue
         ;;
@@ -489,7 +586,7 @@ cmd_spawn() {
         break
         ;;
       -*)
-        die "Unknown flag '$1' for spawn. Usage: agentvm spawn <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t KEY=VAL]... [-- cmd...]"
+        die "Unknown flag '$1' for spawn. Usage: agentvm spawn <name> [-p <profile>] [--no-gitlawb] [--prompt <file>] [-t KEY=VAL]... [-- cmd...]"
         ;;
       *)
         if $parsing_name; then
@@ -503,7 +600,7 @@ cmd_spawn() {
     shift
   done
 
-  [[ -n "$name" ]] || die "Usage: agentvm spawn <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t KEY=VAL]... [-- cmd...]"
+  [[ -n "$name" ]] || die "Usage: agentvm spawn <name> [-p <profile>] [--gitlawb|--no-gitlawb] [--prompt <file>] [-t KEY=VAL]... [-- cmd...]"
   validate_name "$name"
 
   # Load profile if specified
@@ -530,6 +627,11 @@ cmd_spawn() {
   local workspace
   workspace="$(workspace_dir "$name")"
   mkdir -p "$workspace"
+
+  # Per-agent HOME: create <workspace>/.home and seed it with the host's state
+  # for this profile (e.g. ~/.claude → <workspace>/.home/.claude). Each agent
+  # gets its own copy so parallel agents don't share session state.
+  seed_agent_home "$workspace" "$name"
 
   # Workspace seeding: copy an existing dir or clone a git repo into the workspace.
   # Happens before the profile post-create script so setup sees the seeded files.
@@ -576,11 +678,14 @@ cmd_spawn() {
     fi
   fi
 
-  # Provision a fresh gitlawb identity for this agent if requested
+  # Provision a fresh gitlawb identity for this agent (default: auto).
+  #   force → require gl, die if missing
+  #   auto  → provision if gl is installed, silent skip otherwise
+  #   off   → don't even try
   local agent_did=""
-  if [[ "$do_gitlawb" == "true" ]]; then
-    agent_did="$(provision_gitlawb_id "$workspace")"
-    # Mount the gl binary read-only inside the sandbox
+  if [[ "$gitlawb_mode" != "off" ]]; then
+    agent_did="$(provision_gitlawb_id "$workspace" "$gitlawb_mode")"
+    # Mount the gl binary read-only inside the sandbox so the agent can use it
     if [[ -n "$GL_BIN" ]]; then
       if [[ -n "$_PROFILE_RO_PATHS" ]]; then
         _PROFILE_RO_PATHS="$_PROFILE_RO_PATHS:$GL_BIN"
@@ -589,6 +694,10 @@ cmd_spawn() {
       fi
     fi
   fi
+
+  # Per-agent git identity (always — even without a DID, attribute commits to
+  # <name>@agentvm.local rather than the host user).
+  setup_agent_git_config "$name" "$workspace" "$agent_did"
 
   local sandbox
   sandbox="$(detect_sandbox_type)"
@@ -610,20 +719,13 @@ cmd_spawn() {
     tmux kill-session -t "$session" 2>/dev/null || true
   fi
 
-  # Forward profile env vars into the tmux session
-  local -a tmux_env_flags=()
-  if [[ -n "${_PROFILE_ENV_VARS:-}" ]]; then
-    local IFS=':'
-    local var
-    for var in $_PROFILE_ENV_VARS; do
-      [[ -n "$var" && -n "${!var:-}" ]] && tmux_env_flags+=(-e "${var}=${!var}")
-    done
-  fi
-  # When gitlawb identity is provisioned, redirect HOME to workspace so the
-  # agent uses its own ~/.gitlawb/ (workspace/.gitlawb/) rather than the host's.
-  if [[ "$do_gitlawb" == "true" ]]; then
-    tmux_env_flags+=(-e "HOME=${workspace}")
-  fi
+  # Always redirect HOME to the per-agent home dir so the agent's CLI sees its
+  # own ~/.claude, ~/.codex, ~/.gitlawb, etc. — never the host's. Provider env
+  # vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, …) inherit naturally from the
+  # parent process via tmux, so we no longer enumerate them per-profile.
+  local agent_home
+  agent_home="$(agent_home_dir "$workspace")"
+  local -a tmux_env_flags=(-e "HOME=${agent_home}" -e "AGENTVM_AGENT=${name}")
 
   # Spawn tmux session
   tmux new-session -d -s "$session" -c "$workspace" "${tmux_env_flags[@]+"${tmux_env_flags[@]}"}" "$sandbox_cmd_str"
@@ -648,7 +750,9 @@ cmd_spawn() {
   save_state "$name" "$pid" "$sandbox" "$workspace" "$created_at" "$session" "${_PROFILE_NAME:-}"
   # Append optional fields so `agentvm restart` / `info` can recover them.
   [[ -n "$agent_did" ]]  && append_state "$name" "AGENT_GITLAWB_DID" "$agent_did"
-  [[ "$do_gitlawb" == "true" ]] && append_state "$name" "AGENT_GITLAWB" "true"
+  # Persist the gitlawb mode the user chose so restart preserves intent.
+  append_state "$name" "AGENT_GITLAWB_MODE" "$gitlawb_mode"
+  [[ -n "$agent_did" ]] && append_state "$name" "AGENT_GITLAWB" "true"
   [[ -n "$tags" ]]        && append_state "$name" "AGENT_TAGS" "$tags"
   [[ -n "$prompt_file" ]] && append_state "$name" "AGENT_PROMPT_FILE" "$prompt_file"
   [[ -n "$from_dir" ]]    && append_state "$name" "AGENT_FROM_DIR" "$from_dir"
@@ -737,7 +841,7 @@ cmd_list() {
   for f in "${env_files[@]}"; do
     AGENT_NAME="" AGENT_PID="" AGENT_SANDBOX="" AGENT_WORKSPACE="" AGENT_CREATED_AT=""
     AGENT_SESSION="" AGENT_PROFILE="" AGENT_TAGS="" AGENT_LOG_FILE=""
-    AGENT_GITLAWB="" AGENT_GITLAWB_DID="" AGENT_PROMPT_FILE="" AGENT_EXTRA_CMD=""
+    AGENT_GITLAWB="" AGENT_GITLAWB_DID="" AGENT_GITLAWB_MODE="" AGENT_PROMPT_FILE="" AGENT_EXTRA_CMD=""
     # shellcheck source=/dev/null
     source "$f"
 
@@ -1144,7 +1248,14 @@ cmd_restart() {
   # Reconstruct the spawn argv from state.
   local -a spawn_args=("$name")
   [[ -n "${AGENT_PROFILE:-}" ]]      && spawn_args+=(--profile "$AGENT_PROFILE")
-  [[ "${AGENT_GITLAWB:-}" == "true" ]] && spawn_args+=(--gitlawb)
+  case "${AGENT_GITLAWB_MODE:-}" in
+    force) spawn_args+=(--gitlawb) ;;
+    off)   spawn_args+=(--no-gitlawb) ;;
+    *)
+      # Legacy state files: AGENT_GITLAWB=true means it was explicitly requested.
+      [[ "${AGENT_GITLAWB:-}" == "true" ]] && spawn_args+=(--gitlawb)
+      ;;
+  esac
   [[ -n "${AGENT_PROMPT_FILE:-}" && -f "${AGENT_PROMPT_FILE}" ]] && spawn_args+=(--prompt "$AGENT_PROMPT_FILE")
   if [[ -n "${AGENT_TAGS:-}" ]]; then
     local IFS=',' t
@@ -1448,18 +1559,17 @@ cmd_profiles() {
   }
 
   local found=0
-  printf "${BOLD}%-16s %-16s %-30s %s${RESET}\n" "PROFILE" "LABEL" "COMMAND" "ENV VARS"
+  printf "${BOLD}%-16s %-16s %-32s %s${RESET}\n" "PROFILE" "LABEL" "COMMAND" "STATE DIRS"
   printf '%s\n' "$(printf '%0.s─' {1..90})"
 
   local f
   for f in "$PROFILES_DIR"/*.env; do
     [[ -f "$f" ]] || continue
     local pname="${f##*/}"; pname="${pname%.env}"
-    PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_ENV_VARS=""
+    PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_STATE_DIRS=""
     # shellcheck source=/dev/null
     source "$f"
-    # Present env vars as comma-separated, first key set highlighted if present
-    local env_display="${PROFILE_ENV_VARS//:/, }"
+    local state_display="${PROFILE_STATE_DIRS//:/, }"
     local has_binary=" "
     local first_word="${PROFILE_CMD%% *}"
     if [[ -n "$first_word" ]] && command -v "$first_word" &>/dev/null; then
@@ -1467,12 +1577,12 @@ cmd_profiles() {
     else
       has_binary="${DIM}○${RESET}"
     fi
-    printf "%s %-14s %-16s %-30s %s\n" \
+    printf "%s %-14s %-16s %-32s %s\n" \
       "$has_binary" \
       "$pname" \
       "$(_trunc "${PROFILE_LABEL:-}" 16)" \
-      "$(_trunc "${PROFILE_CMD:-}" 30)" \
-      "$(_trunc "${env_display}" 40)"
+      "$(_trunc "${PROFILE_CMD:-}" 32)" \
+      "$(_trunc "${state_display}" 40)"
     (( found++ )) || true
   done
 
@@ -1480,6 +1590,7 @@ cmd_profiles() {
     dim "No profiles found in $PROFILES_DIR"
   else
     printf "\n${DIM}● installed    ○ binary not found in PATH${RESET}\n"
+    printf "${DIM}State dirs are seeded into <workspace>/.home/ at spawn time so each agent gets isolated state.${RESET}\n"
   fi
 
   unset -f _trunc
@@ -1747,42 +1858,52 @@ cmd_doctor() {
     warn=$((warn+1))
   fi
 
-  # Profile deps
-  printf "\n${BOLD}Profiles${RESET}\n"
-  local f
+  # Profile / harness installation status
+  printf "\n${BOLD}Harnesses${RESET}\n"
+  local f installed_count=0 missing=()
   for f in "$PROFILES_DIR"/*.env; do
     [[ -f "$f" ]] || continue
     local pname="${f##*/}"; pname="${pname%.env}"
-    PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_ENV_VARS=""
+    PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" PROFILE_STATE_DIRS=""
     # shellcheck source=/dev/null
     source "$f"
 
-    # Check the first word of the default cmd is resolvable (missing agent binary
-    # is a warning, not a hard failure — user may have installed only a subset)
     local first_word="${PROFILE_CMD%% *}"
     if [[ -n "$first_word" ]] && command -v "$first_word" &>/dev/null; then
-      printf "%s %-18s binary: %s\n" "$pass" "$pname" "$(command -v "$first_word")"
+      printf "%s %-18s %s\n" "$pass" "$pname" "$(command -v "$first_word")"
+      installed_count=$((installed_count+1))
       ok=$((ok+1))
     else
-      printf "%s %-18s binary '%s' not found in PATH\n" "$warn_sym" "$pname" "$first_word"
-      warn=$((warn+1))
-    fi
-
-    # Check required env vars
-    if [[ -n "$PROFILE_ENV_VARS" ]]; then
-      local IFS=':' var
-      for var in $PROFILE_ENV_VARS; do
-        [[ -n "$var" ]] || continue
-        if [[ -n "${!var:-}" ]]; then
-          printf "   %s %s: set\n" "$pass" "$var"
-        else
-          printf "   %s %s: not set\n" "$warn_sym" "$var"
-          warn=$((warn+1))
-        fi
-      done
-      unset IFS
+      missing+=("$pname ($first_word)")
     fi
   done
+
+  if (( ${#missing[@]} > 0 )); then
+    local joined=""
+    local m
+    for m in "${missing[@]}"; do
+      [[ -z "$joined" ]] && joined="$m" || joined="$joined, $m"
+    done
+    printf "${DIM}   not installed: %s${RESET}\n" "$joined"
+  fi
+
+  if [[ $installed_count -eq 0 ]]; then
+    printf "%s no agent CLIs installed — install at least one to spawn agents\n" "$warn_sym"
+    warn=$((warn+1))
+  fi
+
+  # Provider credentials (informational — agents inherit whatever's in the host env)
+  printf "\n${BOLD}Provider credentials${RESET} ${DIM}(inherited from shell + ~/.agentvm/env)${RESET}\n"
+  local provider_var seen_any=false
+  for provider_var in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY DEEPSEEK_API_KEY GROQ_API_KEY; do
+    if [[ -n "${!provider_var:-}" ]]; then
+      printf "%s %s\n" "$pass" "$provider_var"
+      seen_any=true
+    fi
+  done
+  if ! $seen_any; then
+    printf "${DIM}   none set — add provider keys to %s or your shell rc${RESET}\n" "$AGENTVM_ENV_FILE"
+  fi
 
   printf "\n${BOLD}Summary${RESET}  ok=%d  warn=%d  fail=%d\n" "$ok" "$warn" "$bad"
   [[ $bad -eq 0 ]] || return 1
@@ -1800,18 +1921,23 @@ cmd_run() {
   local keep=false
   local prompt_file=""
   local name=""
+  # Ephemeral one-shots default to no DID (no point registering an identity
+  # for a throwaway agent). Pass --gitlawb to override.
+  local gitlawb_flag="--no-gitlawb"
   local -a extra_cmd=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --profile|-p) profile_name="$2"; shift 2 ;;
-      --timeout)    timeout="$2";      shift 2 ;;
-      --prompt|-P)  prompt_file="$2";  shift 2 ;;
-      --name)       name="$2";         shift 2 ;;
-      --keep)       keep=true;         shift ;;
-      --)           shift; extra_cmd=("$@"); break ;;
-      -*)           die "Unknown flag '$1' for run" ;;
-      *)            extra_cmd=("$@"); break ;;
+      --profile|-p)         profile_name="$2"; shift 2 ;;
+      --timeout)            timeout="$2";      shift 2 ;;
+      --prompt|-P)          prompt_file="$2";  shift 2 ;;
+      --name)               name="$2";         shift 2 ;;
+      --keep)               keep=true;         shift ;;
+      --gitlawb|--id)       gitlawb_flag="--gitlawb";    shift ;;
+      --no-gitlawb|--no-id) gitlawb_flag="--no-gitlawb"; shift ;;
+      --)                   shift; extra_cmd=("$@"); break ;;
+      -*)                   die "Unknown flag '$1' for run" ;;
+      *)                    extra_cmd=("$@"); break ;;
     esac
   done
 
@@ -1821,7 +1947,7 @@ cmd_run() {
   fi
 
   # Build spawn args
-  local -a spawn_args=("$name")
+  local -a spawn_args=("$name" "$gitlawb_flag")
   [[ -n "$profile_name" ]] && spawn_args+=(--profile "$profile_name")
   [[ -n "$prompt_file" ]]  && spawn_args+=(--prompt "$prompt_file")
   if [[ ${#extra_cmd[@]} -gt 0 ]]; then
@@ -2132,7 +2258,8 @@ _agentvm() {
         '(-p --profile)'{-p,--profile}'[profile]:profile:->profiles' \
         '(-P --prompt)'{-P,--prompt}'[prompt file]:file:_files' \
         '(-t --tag)'{-t,--tag}'[tag]:KEY=VALUE' \
-        '--gitlawb[provision DID]'
+        '--gitlawb[force provision a DID (fail if gl missing)]' \
+        '--no-gitlawb[skip DID provisioning]'
       case $state in
         profiles)
           profiles=("${(@f)$(agentvm profiles 2>/dev/null | awk 'NR>2{print $1}')}")
@@ -2346,45 +2473,31 @@ cmd_open() {
 cmd_keys() {
   init_dirs
 
-  # Collect all env var names referenced by all profiles (deduped)
-  local -a all_vars=()
-  local f
-  for f in "$PROFILES_DIR"/*.env; do
-    [[ -f "$f" ]] || continue
-    PROFILE_LABEL="" PROFILE_CMD="" PROFILE_RO_PATHS="" PROFILE_RW_PATHS="" \
-      PROFILE_ENV_VARS="" PROFILE_POST_CREATE_SCRIPT=""
-    # shellcheck source=/dev/null
-    source "$f" 2>/dev/null || true
-    if [[ -n "${PROFILE_ENV_VARS:-}" ]]; then
-      local IFS=':'
-      local var
-      for var in $PROFILE_ENV_VARS; do
-        [[ -n "$var" ]] || continue
-        local found=false; local v
-        for v in "${all_vars[@]+"${all_vars[@]}"}"; do
-          [[ "$v" == "$var" ]] && found=true && break
-        done
-        $found || all_vars+=("$var")
-      done
-    fi
-  done
+  # Curated list of provider env vars commonly used by coding-agent CLIs.
+  # Agents inherit whatever's in the host env (shell + ~/.agentvm/env), so this
+  # is just a status snapshot, not a forwarding list.
+  local -a all_vars=(
+    ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_API_KEY
+    OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_MODEL CLAUDE_CODE_USE_OPENAI
+    GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_CLOUD_PROJECT GEMINI_MODEL
+    OPENROUTER_API_KEY DEEPSEEK_API_KEY GROQ_API_KEY
+    FIRECRAWL_API_KEY AIDER_MODEL
+  )
 
   printf "${BOLD}Key file:${RESET} %s\n\n" "$AGENTVM_ENV_FILE"
 
-  if [[ ${#all_vars[@]} -eq 0 ]]; then
-    dim "  No profiles with env vars found."
-    return 0
-  fi
-
-  local var
+  local var any_set=false
   for var in "${all_vars[@]}"; do
     if [[ -n "${!var:-}" ]]; then
       local masked="${!var:0:12}..."
       printf "  ${GREEN}✓${RESET} %-28s ${DIM}%s${RESET}\n" "$var" "$masked"
-    else
-      printf "  ${RED}✗${RESET} %-28s ${DIM}not set${RESET}\n" "$var"
+      any_set=true
     fi
   done
+
+  if ! $any_set; then
+    dim "  No provider keys set. Edit ${AGENTVM_ENV_FILE} to add some."
+  fi
 
   printf "\n${DIM}Edit: \$EDITOR %s${RESET}\n" "$AGENTVM_ENV_FILE"
 }
@@ -2407,9 +2520,10 @@ ${BOLD}USAGE${RESET}
   agentvm <command> [arguments]
 
 ${BOLD}LIFECYCLE${RESET}
-  ${CYAN}spawn${RESET} <name> [-p <profile>] [--gitlawb] [--prompt <file>] [-t K=V]...
+  ${CYAN}spawn${RESET} <name> [-p <profile>] [--no-gitlawb] [--prompt <file>] [-t K=V]...
         [--from-dir <path>|--from-git <url> [--ref <ref>]] [-- cmd...]
                                               Create workspace and start sandboxed tmux session
+                                              (DID auto-provisioned by default; pass --no-gitlawb to opt out)
   ${CYAN}run${RESET}   [-p <profile>] [--prompt <file>] [--timeout <s>] [--keep] [-- cmd...]
                                               Spawn → wait → print output → cleanup (ephemeral)
   ${CYAN}swarm${RESET} <base> <n> [-p <profile>] [--prompt <file>] [-t K=V]...
@@ -2492,25 +2606,36 @@ ${BOLD}EXAMPLES${RESET}
   agentvm doctor
 
 ${BOLD}PROFILES${RESET}
-  Profiles configure sandbox permissions, default command, and env var forwarding
-  for specific agent types. See profiles/ directory. Create your own as profiles/<name>.env.
+  Profiles declare which CLI to run, what binary paths the sandbox needs, and
+  which host state dirs to seed into the agent's per-spawn HOME.
+  See profiles/ directory. Create your own as profiles/<name>.env.
 
   Profile variables:
-    PROFILE_LABEL      Human-readable name
-    PROFILE_CMD        Default command (overridden by -- cmd...)
-    PROFILE_RO_PATHS   Colon-separated paths to mount read-only in sandbox
-    PROFILE_RW_PATHS   Colon-separated paths to mount read-write in sandbox
-    PROFILE_ENV_VARS   Colon-separated env var names to forward into sandbox
+    PROFILE_LABEL       Human-readable name
+    PROFILE_CMD         Default command (overridden by -- cmd...)
+    PROFILE_RO_PATHS    Colon-separated paths to mount read-only in sandbox
+    PROFILE_RW_PATHS    Colon-separated paths to mount read-write (rare)
+    PROFILE_STATE_DIRS  Colon-separated paths (relative to \$HOME) seeded into
+                        <workspace>/.home/ at spawn — gives the agent its own
+                        copy of e.g. ~/.claude, ~/.codex.
 
 ${BOLD}GITLAWB IDENTITY${RESET}
-  Pass ${CYAN}--gitlawb${RESET} to provision a fresh Ed25519 DID for the agent at spawn time.
-  The identity is stored in <workspace>/.gitlawb/ and registered with the gitlawb
-  network. The agent's HOME is set to its workspace so it uses its own identity.
-  Requires the ${BOLD}gl${RESET} binary (install from gitlawb.com).
+  Each spawned agent gets a fresh Ed25519 DID by default (auto mode), provided
+  the ${BOLD}gl${RESET} binary is installed. The identity lives in <workspace>/.home/.gitlawb/
+  and is registered with the gitlawb network. The agent's ~/.gitconfig is
+  pre-populated with user.name=<agent-name> and user.email=<DID>@gitlawb so
+  any commits/PRs are attributable to the agent.
+
+  Flags:
+    ${CYAN}--gitlawb${RESET}      Force-provision (fail if gl is not installed)
+    ${CYAN}--no-gitlawb${RESET}   Skip identity provisioning entirely
+  Config: set ${BOLD}AGENTVM_GITLAWB_DEFAULT=false${RESET} in ~/.agentvm/config to flip the
+  default to off (requires explicit --gitlawb to opt in).
+  Install gl from gitlawb.com.
 
 ${BOLD}API KEYS${RESET}
-  Place API keys in ${BOLD}\$AGENTVM_HOME/env${RESET} (created automatically on first run).
-  They are sourced before every command and forwarded into agent sandboxes.
+  Place provider keys in ${BOLD}\$AGENTVM_HOME/env${RESET} (created automatically on first run).
+  Anything exported there (or in your shell rc) is inherited by the agent sandbox.
 
   Example ~/.agentvm/env:
     ANTHROPIC_API_KEY=sk-ant-...
